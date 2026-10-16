@@ -1,0 +1,1297 @@
+---
+title: "Survival GLM & PALM Trees Project"
+author: "Amirreza Rezaei"
+date: "2026-07-27"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo      = TRUE,
+  warning   = FALSE,
+  message   = FALSE,
+  fig.align = "center",
+  fig.width = 9,
+  fig.height = 6
+)
+```
+
+# 0. Packages & Data Preparation
+
+## 0.1 Libraries
+
+```{r libraries}
+# install.packages(c("partykit", "palmtree", "TH.data", "survival",
+#                    "Formula", "sandwich", "pec", "ggplot2", "tidyr", "scales"))
+
+library(partykit)
+library(palmtree)
+library(TH.data)
+library(survival)
+library(Formula)
+library(sandwich)
+library(pec)
+library(ggplot2)
+library(tidyr)
+library(parallel)
+library(scales)
+```
+
+## 0.2 Loading Data
+
+```{r load-data}
+data("GBSG2", package = "TH.data")
+
+GBSG2$y_surv        <- with(GBSG2, Surv(time, cens))
+GBSG2$horTh_numeric <- ifelse(GBSG2$horTh == "yes", 1, 0)
+
+# Data frame without Surv column for full compatibility with the pec package
+clean_data        <- GBSG2
+clean_data$y_surv <- NULL
+
+eval_times <- seq(100, 2500, by = 100)
+```
+
+## 0.3 Baseline Cox & Weibull Models
+
+```{r baseline-models}
+cox_fit <- coxph(y_surv ~ horTh, data = GBSG2, x = TRUE, y = TRUE)
+print(cox_fit)
+
+cat("--------------------------------------------------\n")
+
+weibull_fit <- survreg(y_surv ~ horTh, data = GBSG2, dist = "weibull", x = TRUE, y = TRUE)
+print(weibull_fit)
+```
+
+------------------------------------------------------------------------
+
+# 1. GLM Tree
+
+```{r glm-tree}
+# Fit GLM Tree model
+glm_tree <- glmtree(
+  cens ~ horTh | age + menostat + tsize + tgrade + progrec + estrec + pnodes,
+  data   = GBSG2,
+  family = binomial
+)
+
+print(glm_tree)
+# print(glm_tree, node = 1) # Parameter instability tests, node = 1
+# print(glm_tree, node = 2) # Parameter instability tests, node = 2
+# print(glm_tree, node = 3) # Parameter instability tests, node = 3
+
+plot(glm_tree, main = "GLM Tree: cens ~ horTh")
+plot(glm_tree, tp_args = list(cdplot = TRUE))
+plot(glm_tree, terminal_panel = NULL)
+
+# Regression coefficients and model evaluation metrics
+coef(glm_tree)
+deviance(glm_tree)
+logLik(glm_tree)
+AIC(glm_tree)
+BIC(glm_tree)
+
+print(summary(glm_tree))
+```
+
+------------------------------------------------------------------------
+
+# 2. PALM Tree (Linear Model)
+
+```{r palm-tree-lm}
+palm_tree <- palmtree(
+  log(time) ~ horTh | age | pnodes + tgrade + progrec + estrec + tsize,
+  data = GBSG2
+)
+
+print(palm_tree)
+# print(palm_tree, node = 1) # Parameter instability tests, node = 1
+
+print(coef(palm_tree))
+plot(palm_tree)
+
+print(summary(palm_tree$tree))
+print(summary(palm_tree$palm))
+```
+
+------------------------------------------------------------------------
+
+# 3. Survival GLM Tree (MOB: Weibull & Cox)
+
+```{r survival-glm-tree}
+glm_formula_surv <- Surv(time, cens) ~ horTh | age + tsize + tgrade + pnodes + progrec + estrec
+
+# ==============================================================================
+# 3.1 GLM Tree + Weibull
+# ==============================================================================
+weibull_fitter <- function(y, x, start = NULL, weights = NULL, offset = NULL, ...,
+                           estfun = FALSE, object = FALSE) {
+  if (is.null(weights)) weights <- rep(1, NROW(y))
+  if (is.null(offset))  offset  <- rep(0, NROW(y))
+
+  if (ncol(x) == 0L) {
+    mod <- survreg(y ~ 1 + offset(offset), weights = weights, dist = "weibull", x = TRUE, y = TRUE)
+  } else {
+    mod <- survreg(y ~ 0 + x + offset(offset), weights = weights, dist = "weibull", x = TRUE, y = TRUE)
+  }
+
+  cf        <- coef(mod)
+  names(cf) <- colnames(x)
+  ef        <- if (estfun) as.matrix(sandwich::estfun(mod)) else NULL
+
+  list(
+    coefficients = cf,
+    objfun       = -as.numeric(logLik(mod)),
+    estfun       = ef,
+    object       = mod
+  )
+}
+
+mob_weibull <- mob(glm_formula_surv, data = clean_data, fit = weibull_fitter)
+plot(mob_weibull, main = "mob_weibull : Survival GLM Tree")
+print(mob_weibull, node = 1)
+
+# ==============================================================================
+# 3.2 GLM Tree + Cox PH
+# ==============================================================================
+cox_fitter <- function(y, x, start = NULL, weights = NULL, offset = NULL, ...,
+                       estfun = FALSE, object = FALSE) {
+  if (is.null(weights)) weights <- rep(1, NROW(y))
+  if (is.null(offset))  offset  <- rep(0, NROW(y))
+
+  x    <- x[, colnames(x) != "(Intercept)", drop = FALSE]
+  df_x <- as.data.frame(x)
+
+  if (ncol(x) == 0L) {
+    mod <- coxph(y ~ 1 + offset(offset), weights = weights, x = TRUE, y = TRUE, model = TRUE)
+  } else {
+    mod <- coxph(y ~ . + offset(offset), data = df_x, weights = weights, x = TRUE, y = TRUE, model = TRUE)
+  }
+
+  cf        <- coef(mod)
+  names(cf) <- colnames(x)
+
+  ef <- NULL
+  if (estfun) {
+    ef           <- as.matrix(sandwich::estfun(mod))
+    colnames(ef) <- names(cf)
+  }
+
+  list(
+    coefficients = cf,
+    objfun       = -as.numeric(logLik(mod)),
+    estfun       = ef,
+    object       = mod
+  )
+}
+
+mob_cox <- mob(glm_formula_surv, data = clean_data, fit = cox_fitter)
+plot(mob_cox, main = "mob_cox : Survival GLM Tree")
+print(mob_cox, node = 1)
+```
+
+------------------------------------------------------------------------
+
+# 4. Survival PALM Tree (`palmtree_AmirR`)
+
+```{r survival-palmtree}
+# ==============================================================================
+# 4.1 Node Fitter for mob (Weibull / Cox)
+# ==============================================================================
+make_surv_fit <- function(method = c("weibull", "cox"), test_scale = FALSE) {
+  method <- match.arg(method)
+  force(test_scale)
+
+  function(y, x, start = NULL, weights = NULL, offset = NULL, ...,
+           estfun = FALSE, object = FALSE) {
+    n <- NROW(x)
+    if (is.null(offset))  offset  <- rep(0, n)
+    if (is.null(weights)) weights <- rep(1, n)
+    x <- x[, colnames(x) != "(Intercept)", drop = FALSE]
+
+    if (method == "weibull") {
+      if (ncol(x) == 0L) {
+        mod <- survreg(y ~ 1 + offset(offset), weights = weights, dist = "weibull")
+      } else {
+        mod <- survreg(y ~ x + offset(offset), weights = weights, dist = "weibull")
+      }
+      cf        <- coef(mod)
+      names(cf) <- c("(Intercept)", colnames(x))
+    } else {
+      if (ncol(x) == 0L) {
+        mod <- coxph(y ~ 1 + offset(offset), weights = weights)
+      } else {
+        mod <- coxph(y ~ x + offset(offset), weights = weights)
+      }
+      cf        <- coef(mod)
+      names(cf) <- colnames(x)
+    }
+
+    ef <- NULL
+    if (estfun) {
+      ef <- tryCatch(
+        as.matrix(sandwich::estfun(mod)),
+        error = function(e) stop("sandwich::estfun() failed: ", conditionMessage(e), call. = FALSE)
+      )
+      if (method == "weibull" && !test_scale && ncol(ef) > length(cf)) {
+        ef <- ef[, seq_along(cf), drop = FALSE] # Remove Log(scale) column
+      }
+    }
+
+    list(
+      coefficients = cf,
+      objfun       = -as.numeric(logLik(mod)),
+      estfun       = ef,
+      object       = if (object) mod else NULL
+    )
+  }
+}
+
+# ==============================================================================
+# 4.2 Helper Functions (Unified Pipeline for lm / glm / weibull / cox)
+# ==============================================================================
+.palm_fit <- function(form, data, method, family = NULL) {
+  switch(
+    method,
+    lm      = if (is.null(family)) lm(form, data = data, weights = .weights)
+              else glm(form, data = data, weights = .weights, family = family),
+    weibull = survreg(form, data = data, weights = .weights, dist = "weibull", model = TRUE),
+    cox     = coxph(form, data = data, weights = .weights, model = TRUE)
+  )
+}
+
+.lin_pred <- function(fit, data, method, zero = NULL) {
+  if (method == "lm") {
+    if (!is.null(zero)) fit$coefficients[zero] <- 0
+    return(as.numeric(predict(fit, newdata = data)))
+  }
+  cf            <- coef(fit)
+  cf[is.na(cf)] <- 0
+  if (!is.null(zero)) cf[zero] <- 0
+
+  tt <- delete.response(terms(fit))
+  mf <- model.frame(tt, data = data, xlev = fit$xlevels, na.action = na.pass)
+  X  <- model.matrix(tt, mf, contrasts.arg = fit$contrasts)
+  as.numeric(X[, names(cf), drop = FALSE] %*% cf)
+}
+
+# ==============================================================================
+# 4.3 Main Function: palmtree_AmirR
+# ==============================================================================
+palmtree_AmirR <- function(formula, data, weights = NULL,
+                           method = c("lm", "weibull", "cox"),
+                           family = NULL, lmstart = NULL,
+                           abstol = 0.001, maxit = 100, dfsplit = TRUE,
+                           verbose = FALSE, plot = FALSE,
+                           test_scale = FALSE, ...) {
+  cl      <- match.call()
+  method  <- match.arg(method)
+  fit_fun <- if (method == "lm") NULL else make_surv_fit(method, test_scale)
+
+  if (!is.null(family) && method == "lm") {
+    if (!inherits(family, "family")) {
+      if (is.character(family)) family <- get(family)
+      if (is.function(family))  family <- family()
+    }
+  }
+
+  ff        <- Formula::as.Formula(formula)
+  tf        <- formula(ff, lhs = 1L, rhs = c(1L, 3L))
+  rf        <- formula(ff, lhs = 1L, rhs = 1L)
+  intercept <- attr(terms(rf), "intercept") > 0L
+  if (!intercept) rf <- update(rf, . ~ . + 1)
+
+  # Extract exact column names of global variables from the 2nd RHS part
+  gf           <- formula(ff, lhs = 0L, rhs = 2L)
+  global_mm    <- model.matrix(terms(gf), data = data)
+  global_names <- setdiff(colnames(global_mm), "(Intercept)")
+
+  rf0 <- formula(Formula::as.Formula(rf, gf), lhs = 1L, rhs = c(1L, 2L), collapse = TRUE)
+  rf  <- if (intercept) update(rf, . ~ .tree / .) else update(rf, . ~ .tree : .)
+  rf  <- formula(Formula::as.Formula(rf, gf), lhs = 1L, rhs = c(1L, 2L), collapse = TRUE)
+
+  data$.weights <- if (is.null(weights)) rep(1, nrow(data)) else weights
+  iteration     <- 0L
+
+  # Initial offset (zeroing out local coefficients from step 1)
+  if (is.null(lmstart)) {
+    fit0      <- .palm_fit(rf0, data, method, family)
+    is_local0 <- !(names(coef(fit0)) %in% global_names)
+    lmstart   <- .lin_pred(fit0, data, method, zero = is_local0)
+  }
+  data$.lm <- lmstart
+
+  continue  <- TRUE
+  oldloglik <- -Inf
+
+  while (continue) {
+    iteration <- iteration + 1L
+
+    # Step A: Fit tree with current offset
+    tree <- if (method == "lm") {
+      if (is.null(family)) {
+        lmtree(tf, data = data, offset = .lm, weights = .weights, dfsplit = FALSE, ...)
+      } else {
+        glmtree(tf, data = data, offset = .lm, weights = .weights, dfsplit = FALSE,
+                family = family, ...)
+      }
+    } else {
+      mob(tf, data = data, weights = .weights, offset = .lm, fit = fit_fun,
+          control = mob_control(dfsplit = FALSE, ...))
+    }
+    if (plot) plot(tree)
+
+    data$.tree <- factor(predict(tree, newdata = data, type = "node"))
+    multi      <- nlevels(data$.tree) > 1L
+
+    # Step B: Fit global PALM model
+    palm <- .palm_fit(if (multi) rf else rf0, data, method, family)
+    nm   <- names(coef(palm))
+
+    # Step C: Identify local coefficients
+    is_local <- !(nm %in% global_names)
+
+    # Step D: Compute pure global offset
+    data$.lm <- .lin_pred(palm, data, method, zero = is_local)
+
+    newloglik <- as.numeric(logLik(palm))
+    continue  <- (newloglik - oldloglik > abstol) & (iteration < maxit)
+    oldloglik <- newloglik
+
+    if (verbose) {
+      cat(sprintf("Iteration: %d | Log-Likelihood: %.4f\n", iteration, oldloglik))
+    }
+  }
+
+  result <- list(
+    formula     = formula,
+    call        = cl,
+    method      = method,
+    tree        = tree,
+    palm        = palm,
+    data        = data,
+    nobs        = nrow(data),
+    loglik      = newloglik,
+    df          = attr(logLik(palm), "df"),
+    dfsplit     = dfsplit,
+    iterations  = iteration,
+    maxit       = maxit,
+    lmstart     = lmstart,
+    abstol      = abstol,
+    intercept   = intercept,
+    family      = family,
+    mob.control = list(...)
+  )
+  class(result) <- "palmtree"
+  result
+}
+
+# ==============================================================================
+# 4.4 Validation and Execution on GBSG2 Dataset
+# ==============================================================================
+check_offset <- function(fit, globals = c("age", "tsize")) {
+  b      <- coef(fit$palm)[globals]
+  manual <- as.numeric(as.matrix(fit$data[, globals]) %*% b)
+  max(abs(fit$data$.lm - manual))
+}
+
+form_surv <- Surv(time, cens) ~ horTh | age + tsize | pnodes + progrec + estrec
+form_lm   <- log(time) ~ horTh | age + tsize | pnodes + progrec + estrec
+
+m_weibull <- palmtree_AmirR(form_surv, data = clean_data, method = "weibull", minsize = 20, verbose = TRUE)
+m_cox     <- palmtree_AmirR(form_surv, data = clean_data, method = "cox",     minsize = 20, verbose = TRUE)
+m_lm      <- palmtree_AmirR(form_lm,   data = clean_data, method = "lm",      minsize = 20, verbose = TRUE)
+
+print(summary(m_weibull$palm))
+plot(m_weibull$tree, main = "Weibull PALM Tree")
+
+print(summary(m_cox$palm))
+plot(m_cox$tree, main = "Cox PALM Tree")
+
+print(summary(m_lm$palm))
+plot(m_lm$tree, main = "LM PALM Tree")
+
+sapply(list(weibull = m_weibull, cox = m_cox, lm = m_lm), check_offset)
+```
+
+------------------------------------------------------------------------
+
+# 5. Model Comparisons
+
+## 5.1 Linear Model (`palmtree` Package vs `palmtree_AmirR`)
+
+```{r compare-lm}
+# Custom algorithm
+mod_lm <- palmtree_AmirR(form_lm, data = clean_data, method = "lm", verbose = TRUE)
+print(mod_lm)
+print(summary(mod_lm$palm))
+plot(mod_lm$tree, main = "LM-PALM Algorithm (palmtree_AmirR)")
+
+# Standard palmtree package
+palm_tree_std <- palmtree(form_lm, data = clean_data)
+print(palm_tree_std)
+print(summary(palm_tree_std$palm))
+plot(palm_tree_std, main = "LM-PALM (palmtree Package)")
+```
+
+## 5.2 Cox Models (Standard, `mob_cox`, `m_cox`)
+
+```{r compare-cox}
+# 1. Standard Cox
+print(cox_fit)
+print(summary(cox_fit))
+
+# 2. MOB Cox
+print(mob_cox)
+print(summary(mob_cox))
+plot(mob_cox, main = "mob_cox : Surv(time, cens) ~ horTh | ...")
+
+# 3. PALM Cox
+print(m_cox)
+print(summary(m_cox$palm))
+plot(m_cox$tree, main = "m_cox : Surv(time, cens) ~ horTh | age + tsize | ...")
+```
+
+## 5.3 Weibull Models (Standard, `mob_weibull`, `m_weibull`)
+
+```{r compare-weibull}
+# 1. Standard Weibull
+print(weibull_fit)
+print(summary(weibull_fit))
+
+# 2. MOB Weibull
+print(mob_weibull)
+print(summary(mob_weibull))
+plot(mob_weibull, main = "mob_weibull : Surv(time, cens) ~ horTh | ...")
+
+# 3. PALM Weibull
+print(m_weibull)
+print(summary(m_weibull$palm))
+plot(m_weibull$tree, main = "m_weibull : Surv(time, cens) ~ horTh | age + tsize | ...")
+```
+
+------------------------------------------------------------------------
+
+# 6. Model Evaluation (C-Index & Brier Score)
+
+## 6.1 Cox Models: C-Index & Brier Score
+
+```{r eval-cox}
+# ==============================================================================
+# Survival Probability Prediction Methods (predictSurvProb) for Cox Trees
+# ==============================================================================
+predictSurvProb.modelparty <- function(object, newdata, times, ...) {
+  nodes        <- predict(object, newdata = newdata, type = "node")
+  unique_nodes <- unique(nodes)
+  prob_matrix  <- matrix(NA_real_, nrow = nrow(newdata), ncol = length(times))
+
+  tt_reg <- delete.response(object$info$terms$response)
+  mf_all <- model.frame(tt_reg, data = newdata, na.action = na.pass)
+  X_all  <- model.matrix(tt_reg, mf_all)
+  X_all  <- X_all[, colnames(X_all) != "(Intercept)", drop = FALSE]
+  df_all <- as.data.frame(X_all)
+
+  for (nd in unique_nodes) {
+    node_model <- object[[nd]]$node$info$object
+    idx        <- which(nodes == nd)
+    df_node    <- df_all[idx, , drop = FALSE]
+
+    sf         <- survival::survfit(node_model, newdata = df_node)
+    sf_summary <- summary(sf, times = times, extend = TRUE)
+
+    if (length(idx) == 1L) {
+      prob_matrix[idx, ] <- sf_summary$surv
+    } else {
+      prob_matrix[idx, ] <- t(sf_summary$surv)
+    }
+  }
+  prob_matrix
+}
+
+predictSurvProb.palmtree <- function(object, newdata, times, ...) {
+  nodes         <- predict(object$tree, newdata = newdata, type = "node")
+  newdata$.tree <- factor(nodes, levels = levels(object$data$.tree))
+
+  palm_model <- object$palm
+  train_data <- object$data
+
+  tt       <- terms(palm_model)
+  mf_train <- model.frame(tt, data = train_data, xlev = palm_model$xlevels)
+  X_train  <- model.matrix(tt, mf_train)
+  X_train  <- X_train[, colnames(X_train) != "(Intercept)", drop = FALSE]
+  Y_train  <- model.response(mf_train)
+
+  valid_names   <- make.names(colnames(X_train))
+  df_train_flat <- cbind(
+    data.frame(Y_surv = Y_train),
+    setNames(as.data.frame(X_train), valid_names)
+  )
+
+  surrogate_form <- as.formula(paste("Y_surv ~", paste(valid_names, collapse = " + ")))
+  surrogate_cox  <- coxph(surrogate_form, data = df_train_flat)
+
+  tt_new      <- delete.response(tt)
+  mf_new      <- model.frame(tt_new, data = newdata, xlev = palm_model$xlevels, na.action = na.pass)
+  X_new       <- model.matrix(tt_new, mf_new)
+  X_new       <- X_new[, colnames(X_new) != "(Intercept)", drop = FALSE]
+  df_new_flat <- setNames(as.data.frame(X_new), valid_names)
+
+  sf         <- survival::survfit(surrogate_cox, newdata = df_new_flat)
+  sf_summary <- summary(sf, times = times, extend = TRUE)
+
+  if (nrow(newdata) == 1L) {
+    matrix(sf_summary$surv, nrow = 1L)
+  } else {
+    t(sf_summary$surv)
+  }
+}
+
+# ==============================================================================
+# 1. Harrell's C-Index (Cox Models)
+# ==============================================================================
+med_time       <- median(clean_data$time)
+surv_mob_cox   <- predictSurvProb(mob_cox, newdata = clean_data, times = med_time)[, 1]
+cindex_mob_cox <- concordance(GBSG2$y_surv ~ surv_mob_cox)$concordance
+
+cat("Harrell's C-index (Standard Cox):", summary(cox_fit)$concordance[1], "\n")
+cat("Harrell's C-index (MOB Cox):     ", cindex_mob_cox, "\n")
+cat("Harrell's C-index (PALM Cox):    ", summary(m_cox$palm)$concordance[1], "\n")
+
+# ==============================================================================
+# 2. Brier Score (Individual & Combined Cox Models)
+# ==============================================================================
+cox_fit_clean <- coxph(Surv(time, cens) ~ horTh, data = clean_data, x = TRUE, y = TRUE)
+
+brier_std_cox <- pec(
+  object  = list(Cox = cox_fit_clean),
+  data    = clean_data,
+  formula = Surv(time, cens) ~ 1,
+  times   = eval_times,
+  exact   = FALSE
+)
+print(brier_std_cox)
+plot(brier_std_cox, main = "Brier Score over Time: Standard Cox Model")
+
+brier_mob_cox <- pec(
+  object  = list(Mob_Cox_Tree = mob_cox),
+  data    = clean_data,
+  formula = Surv(time, cens) ~ 1,
+  times   = eval_times,
+  exact   = FALSE
+)
+print(brier_mob_cox)
+plot(brier_mob_cox, main = "Brier Score over Time: MOB Cox Tree", col = c("black", "blue"), legend = TRUE)
+
+brier_m_cox <- pec(
+  object  = list(PALM_Cox = m_cox),
+  data    = clean_data,
+  formula = Surv(time, cens) ~ 1,
+  times   = eval_times,
+  exact   = FALSE
+)
+print(brier_m_cox)
+plot(brier_m_cox, main = "Brier Score over Time: PALM Cox Tree", col = c("black", "darkgreen"), legend = TRUE)
+
+brier_all_cox <- pec(
+  object = list(
+    Standard_Cox  = cox_fit_clean,
+    GLM_Tree_Cox  = mob_cox,
+    PALM_Tree_Cox = m_cox
+  ),
+  data    = clean_data,
+  formula = Surv(time, cens) ~ 1,
+  times   = eval_times,
+  exact   = FALSE
+)
+print(brier_all_cox)
+plot(
+  brier_all_cox,
+  main   = "Cox Models Comparison: Prediction Error (Brier Score)",
+  col    = c("black", "blue", "red", "darkgreen"),
+  lty    = c(1, 1, 2, 2),
+  legend = TRUE
+)
+
+# ==============================================================================
+# 3. Time-Dependent C-Index (All Cox Models)
+# ==============================================================================
+cindex_all_cox <- cindex(
+  object = list(
+    Standard_Cox  = cox_fit_clean,
+    GLM_Tree_Cox  = mob_cox,
+    PALM_Tree_Cox = m_cox
+  ),
+  formula    = Surv(time, cens) ~ 1,
+  data       = clean_data,
+  eval.times = eval_times
+)
+print(cindex_all_cox)
+plot(
+  cindex_all_cox,
+  main   = "Time-Dependent C-Index: Cox Models Comparison",
+  col    = c("blue", "red", "darkgreen"),
+  lty    = c(1, 2, 2),
+  legend = TRUE,
+  ylim   = c(0.4, 1)
+)
+```
+
+## 6.2 Weibull Models: C-Index & Brier Score
+
+```{r eval-weibull}
+# ==============================================================================
+# Survival Probability Prediction Methods (predictSurvProb) for Weibull Models
+# ==============================================================================
+predictSurvProb.survreg <- function(object, newdata, times, ...) {
+  lp    <- predict(object, newdata = newdata, type = "lp")
+  scale <- object$scale
+
+  prob_matrix <- sapply(times, function(t) {
+    if (t <= 0) rep(1, length(lp)) else exp(-exp((log(t) - lp) / scale))
+  })
+
+  if (length(lp) == 1L) matrix(prob_matrix, nrow = 1L) else prob_matrix
+}
+
+class(mob_weibull) <- c("mob_weib_tree", class(mob_weibull))
+
+predictSurvProb.mob_weib_tree <- function(object, newdata, times, ...) {
+  nodes        <- predict(object, newdata = newdata, type = "node")
+  unique_nodes <- unique(nodes)
+  prob_matrix  <- matrix(NA_real_, nrow = nrow(newdata), ncol = length(times))
+
+  tt_reg <- delete.response(object$info$terms$response)
+  mf_all <- model.frame(tt_reg, data = newdata, na.action = na.pass)
+  X_all  <- model.matrix(tt_reg, mf_all)
+
+  for (nd in unique_nodes) {
+    node_model <- object[[nd]]$node$info$object
+    idx        <- which(nodes == nd)
+    X_node     <- X_all[idx, , drop = FALSE]
+
+    lp    <- as.numeric(X_node %*% coef(node_model))
+    scale <- node_model$scale
+
+    node_probs <- sapply(times, function(t) {
+      if (t <= 0) rep(1, length(lp)) else exp(-exp((log(t) - lp) / scale))
+    })
+
+    prob_matrix[idx, ] <- if (length(idx) == 1L) matrix(node_probs, nrow = 1L) else node_probs
+  }
+  prob_matrix
+}
+
+class(m_weibull) <- c("palm_weibull", class(m_weibull))
+
+predictSurvProb.palm_weibull <- function(object, newdata, times, ...) {
+  nodes         <- predict(object$tree, newdata = newdata, type = "node")
+  newdata$.tree <- factor(nodes, levels = levels(object$data$.tree))
+
+  palm_model <- object$palm
+  train_data <- object$data
+
+  tt       <- terms(palm_model)
+  mf_train <- model.frame(tt, data = train_data, xlev = palm_model$xlevels)
+  X_train  <- model.matrix(tt, mf_train)
+  X_train  <- X_train[, colnames(X_train) != "(Intercept)", drop = FALSE]
+  Y_train  <- model.response(mf_train)
+
+  valid_names          <- make.names(colnames(X_train))
+  df_train_flat        <- setNames(as.data.frame(X_train), valid_names)
+  df_train_flat$Y_surv <- Y_train
+
+  surrogate_form    <- as.formula(paste("Y_surv ~", paste(valid_names, collapse = " + ")))
+  surrogate_weibull <- survreg(surrogate_form, data = df_train_flat, dist = "weibull")
+
+  tt_new      <- delete.response(tt)
+  mf_new      <- model.frame(tt_new, data = newdata, xlev = palm_model$xlevels, na.action = na.pass)
+  X_new       <- model.matrix(tt_new, mf_new)
+  X_new       <- X_new[, colnames(X_new) != "(Intercept)", drop = FALSE]
+  df_new_flat <- setNames(as.data.frame(X_new), valid_names)
+
+  lp    <- predict(surrogate_weibull, newdata = df_new_flat, type = "lp")
+  scale <- surrogate_weibull$scale
+
+  prob_matrix <- sapply(times, function(t) {
+    if (t <= 0) rep(1, length(lp)) else exp(-exp((log(t) - lp) / scale))
+  })
+
+  if (length(lp) == 1L) matrix(prob_matrix, nrow = 1L) else prob_matrix
+}
+
+# ==============================================================================
+# 1. Harrell's C-Index (Weibull Models)
+# ==============================================================================
+surv_mob_weibull <- predictSurvProb(mob_weibull, newdata = clean_data, times = med_time)[, 1]
+c_index_mob_w    <- concordance(GBSG2$y_surv ~ surv_mob_weibull)$concordance
+
+cat("Harrell's C-index (Standard Weibull):", concordance(weibull_fit)$concordance, "\n")
+cat("Harrell's C-index (MOB Weibull):     ", c_index_mob_w, "\n")
+cat("Harrell's C-index (PALM Weibull):    ", concordance(m_weibull$palm)$concordance, "\n")
+
+# ==============================================================================
+# 2. Brier Score (Individual & Combined Weibull Models)
+# ==============================================================================
+std_weibull_fit <- survreg(
+  Surv(time, cens) ~ horTh,
+  data = clean_data,
+  dist = "weibull",
+  x    = TRUE,
+  y    = TRUE
+)
+
+brier_std_weibull <- pec(
+  object  = list(Standard_Weibull = std_weibull_fit),
+  data    = clean_data,
+  formula = Surv(time, cens) ~ 1,
+  times   = eval_times,
+  exact   = FALSE
+)
+print(brier_std_weibull)
+plot(brier_std_weibull, main = "Brier Score over Time: Standard Weibull", col = c("black", "purple"), legend = TRUE)
+
+brier_mob_weibull <- pec(
+  object  = list(Mob_Weibull_Tree = mob_weibull),
+  data    = clean_data,
+  formula = Surv(time, cens) ~ 1,
+  times   = eval_times,
+  exact   = FALSE
+)
+print(brier_mob_weibull)
+plot(brier_mob_weibull, main = "Brier Score over Time: MOB Weibull Tree", col = c("black", "orange"), legend = TRUE)
+
+brier_m_weibull <- pec(
+  object  = list(PALM_Weibull_Tree = m_weibull),
+  data    = clean_data,
+  formula = Surv(time, cens) ~ 1,
+  times   = eval_times,
+  exact   = FALSE
+)
+print(brier_m_weibull)
+plot(brier_m_weibull, main = "Brier Score over Time: PALM Weibull Tree", col = c("black", "brown"), legend = TRUE)
+
+brier_all_weibull <- pec(
+  object = list(
+    Standard_Weibull  = std_weibull_fit,
+    Mob_Weibull_Tree  = mob_weibull,
+    PALM_Weibull_Tree = m_weibull
+  ),
+  data    = clean_data,
+  formula = Surv(time, cens) ~ 1,
+  times   = eval_times,
+  exact   = FALSE
+)
+print(brier_all_weibull)
+plot(
+  brier_all_weibull,
+  main   = "Weibull Models Comparison: Prediction Error (Brier Score)",
+  col    = c("black", "purple", "orange", "brown"),
+  lty    = c(1, 1, 2, 2),
+  legend = TRUE
+)
+```
+
+------------------------------------------------------------------------
+
+# 7. Simulation Study
+
+## 7.1 Weibull Simulation
+
+```{r sim-weibull}
+# ==============================================================================
+# Comprehensive Simulation of Survival PALM Trees (PALM-Surv)
+# Approach: Parametric Weibull (AFT) Model
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Part 1: Data Generating Processes (DGP) based on Weibull AFT
+# ------------------------------------------------------------------------------
+
+# Base DGP (for Scenarios 1 and 3)
+gen_data_weibull_base <- function(n = 500, cens_rate = 0.05, sigma = 0.7) {
+  d <- data.frame(
+    trt = factor(rbinom(n, 1, 0.5), levels = 0:1, labels = c("no", "yes")),
+    x1  = rnorm(n, 0, 1),
+    x2  = rnorm(n, 0, 1),
+    z1  = runif(n, -1, 1),
+    z2  = runif(n, -1, 1),
+    z3  = runif(n, -1, 1)
+  )
+  d$true_leaf <- as.integer(d$z1 > 0)
+
+  # AFT linear predictor
+  mu <- 2.0 + (0.5 * d$x1) + (-0.3 * d$x2) +
+    (d$true_leaf * 1.0) +
+    (d$trt == "yes") * (d$true_leaf * 0.8)
+
+  t_event <- exp(mu + sigma * log(rexp(n)))
+  t_cens  <- rexp(n, rate = cens_rate)
+
+  d$time   <- pmin(t_event, t_cens)
+  d$cens   <- as.integer(t_event <= t_cens)
+  d$y_surv <- Surv(d$time, d$cens)
+  return(d)
+}
+
+# Scenario 2 DGP (No subgroups - Type I Error evaluation)
+gen_data_weibull_scen2 <- function(n = 500, cens_rate = 0.05, sigma = 0.7) {
+  d <- data.frame(
+    trt = factor(rbinom(n, 1, 0.5), levels = 0:1, labels = c("no", "yes")),
+    x1  = rnorm(n, 0, 1),
+    x2  = rnorm(n, 0, 1),
+    z1  = runif(n, -1, 1),
+    z2  = runif(n, -1, 1),
+    z3  = runif(n, -1, 1),
+    z4  = runif(n, -1, 1),
+    z5  = runif(n, -1, 1)
+  )
+
+  # Homogeneous population (no effect of Z)
+  mu <- 2.0 + (0.5 * d$x1) + (-0.3 * d$x2) + (d$trt == "yes") * 0.8
+
+  t_event <- exp(mu + sigma * log(rexp(n)))
+  t_cens  <- rexp(n, rate = cens_rate)
+
+  d$time   <- pmin(t_event, t_cens)
+  d$cens   <- as.integer(t_event <= t_cens)
+  d$y_surv <- Surv(d$time, d$cens)
+  return(d)
+}
+
+# Scenario 4 DGP (Multicollinearity between X1 and Z2)
+gen_data_weibull_scen4 <- function(n = 500, cens_rate = 0.05, sigma = 0.7) {
+  rho           <- 0.7
+  x1            <- rnorm(n, 0, 1)
+  z2_correlated <- rho * x1 + sqrt(1 - rho^2) * rnorm(n, 0, 1)
+
+  d <- data.frame(
+    trt = factor(rbinom(n, 1, 0.5), levels = 0:1, labels = c("no", "yes")),
+    x1  = x1,
+    x2  = rnorm(n, 0, 1),
+    z1  = runif(n, -1, 1),
+    z2  = z2_correlated,
+    z3  = runif(n, -1, 1)
+  )
+  d$true_leaf <- as.integer(d$z1 > 0)
+
+  mu <- 2.0 + (0.5 * d$x1) + (-0.3 * d$x2) +
+    (d$true_leaf * 1.0) +
+    (d$trt == "yes") * (d$true_leaf * 0.8)
+
+  t_event <- exp(mu + sigma * log(rexp(n)))
+  t_cens  <- rexp(n, rate = cens_rate)
+
+  d$time   <- pmin(t_event, t_cens)
+  d$cens   <- as.integer(t_event <= t_cens)
+  d$y_surv <- Surv(d$time, d$cens)
+  return(d)
+}
+
+# ------------------------------------------------------------------------------
+# Part 2: Parallel Monte Carlo Simulation Engine
+# ------------------------------------------------------------------------------
+run_weibull_scenario <- function(scenario, R = 100, n = 500, num_cores = 8) {
+  true_gamma <- c(x1 = 0.5, x2 = -0.3)
+
+  results <- mclapply(1:R, function(i) {
+    # Generate data based on scenario
+    if (scenario == 1) {
+      data_sim <- gen_data_weibull_base(n = n, cens_rate = 0.05)
+      form     <- y_surv ~ trt | x1 + x2 | z1 + z2 + z3
+    } else if (scenario == 2) {
+      data_sim <- gen_data_weibull_scen2(n = n, cens_rate = 0.05)
+      form     <- y_surv ~ trt | x1 + x2 | z1 + z2 + z3 + z4 + z5
+    } else if (scenario == 3) {
+      data_sim <- gen_data_weibull_base(n = n, cens_rate = 0.8) # High censoring (~90%)
+      form     <- y_surv ~ trt | x1 + x2 | z1 + z2 + z3
+    } else if (scenario == 4) {
+      data_sim <- gen_data_weibull_scen4(n = n, cens_rate = 0.05)
+      form     <- y_surv ~ trt | x1 + x2 | z1 + z2 + z3
+    }
+
+    obs_cens <- 1 - mean(data_sim$cens)
+
+    # Fit Weibull PALM tree
+    fit <- tryCatch({
+      palmtree_AmirR(
+        formula = form,
+        data    = data_sim,
+        method  = "weibull",
+        minsize = 30
+      )
+    }, error = function(e) return(NULL))
+
+    if (is.null(fit)) return(NULL)
+
+    predicted_nodes <- fit$data$.tree
+    n_leaves        <- nlevels(predicted_nodes)
+
+    if (scenario == 2) {
+      metric_val <- as.integer(n_leaves > 1) # False Positive Rate
+    } else {
+      metric_val <- sum(apply(table(predicted_nodes, data_sim$true_leaf), 1, max)) / nrow(data_sim) # Purity
+    }
+
+    est_gamma <- coef(fit$palm)[c("x1", "x2")]
+
+    return(c(n_leaves = n_leaves, metric = metric_val, obs_cens = obs_cens, est_gamma))
+  }, mc.cores = num_cores)
+
+  # Filter out failed iterations
+  results    <- Filter(Negate(is.null), results)
+  res_matrix <- do.call(rbind, results)
+
+  # Compute final summary statistics
+  summary_stats <- data.frame(
+    Censoring_Rate = mean(res_matrix[, "obs_cens"]),
+    Mean_Leaves    = mean(res_matrix[, "n_leaves"])
+  )
+
+  if (scenario == 2) {
+    summary_stats$Type_I_Error <- mean(res_matrix[, "metric"])
+  } else {
+    summary_stats$Mean_Purity  <- mean(res_matrix[, "metric"])
+  }
+
+  # Use na.rm = TRUE to handle potential variance estimation issues under high censoring
+  summary_stats$Bias_x1      <- mean(res_matrix[, "x1"], na.rm = TRUE) - true_gamma["x1"]
+  summary_stats$Bias_x2      <- mean(res_matrix[, "x2"], na.rm = TRUE) - true_gamma["x2"]
+  summary_stats$RMSE_x1      <- sqrt(mean((res_matrix[, "x1"] - true_gamma["x1"])^2, na.rm = TRUE))
+  summary_stats$RMSE_x2      <- sqrt(mean((res_matrix[, "x2"] - true_gamma["x2"])^2, na.rm = TRUE))
+  summary_stats$Success_Rate <- nrow(res_matrix) / R
+
+  return(summary_stats)
+}
+
+# ------------------------------------------------------------------------------
+# Part 3: Execute All 4 Scenarios
+# ------------------------------------------------------------------------------
+RNGkind("L'Ecuyer-CMRG")
+cores_to_use <- 8
+R_iter       <- 5 # Set to 50 for initial testing
+
+# Scenario 1 (Ideal)
+set.seed(2001)
+cat("\nRunning Scenario 1 (Weibull - Ideal Structure)...\n")
+system.time({ sum_scen1_w <- run_weibull_scenario(1, R = R_iter, num_cores = cores_to_use) })
+print("--- Scenario 1 Results ---")
+print(sum_scen1_w)
+
+# Scenario 2 (No Subgroup)
+set.seed(2002)
+cat("\nRunning Scenario 2 (Weibull - Type I Error)...\n")
+system.time({ sum_scen2_w <- run_weibull_scenario(2, R = R_iter, num_cores = cores_to_use) })
+print("--- Scenario 2 Results ---")
+print(sum_scen2_w)
+
+# Scenario 3 (High Censoring)
+set.seed(2003)
+cat("\nRunning Scenario 3 (Weibull - High Censoring)...\n")
+system.time({ sum_scen3_w <- run_weibull_scenario(3, R = R_iter, num_cores = cores_to_use) })
+print("--- Scenario 3 Results ---")
+print(sum_scen3_w)
+
+# Scenario 4 (Multicollinearity)
+set.seed(2004)
+cat("\nRunning Scenario 4 (Weibull - Multicollinearity)...\n")
+system.time({ sum_scen4_w <- run_weibull_scenario(4, R = R_iter, num_cores = cores_to_use) })
+print("--- Scenario 4 Results ---")
+print(sum_scen4_w)
+```
+
+## 7.2 Cox Simulation
+
+```{r sim-cox}
+# ==============================================================================
+# Comprehensive Simulation of Survival PALM Trees (PALM-Surv)
+# Approach: Semi-parametric Cox Proportional Hazards Model
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Part 1: Data Generating Processes (DGP) under Proportional Hazards (PH)
+# ------------------------------------------------------------------------------
+
+# Base DGP (for Scenarios 1 and 3)
+gen_data_cox_base <- function(n = 500, cens_rate = 0.05) {
+  d <- data.frame(
+    trt = factor(rbinom(n, 1, 0.5), levels = 0:1, labels = c("no", "yes")),
+    x1  = rnorm(n, 0, 1),
+    x2  = rnorm(n, 0, 1),
+    z1  = runif(n, -1, 1),
+    z2  = runif(n, -1, 1),
+    z3  = runif(n, -1, 1)
+  )
+  d$true_leaf <- as.integer(d$z1 > 0)
+
+  # True Cox coefficients (Log Hazard Ratios)
+  mu <- (0.5 * d$x1) + (-0.3 * d$x2) +
+    (d$true_leaf * 1.0) +
+    (d$trt == "yes") * (d$true_leaf * 0.8)
+
+  # Generate survival time under PH assumption (Exponential baseline hazard)
+  t_event <- rexp(n) / exp(mu)
+  t_cens  <- rexp(n, rate = cens_rate)
+
+  d$time   <- pmin(t_event, t_cens)
+  d$cens   <- as.integer(t_event <= t_cens)
+  d$y_surv <- Surv(d$time, d$cens)
+  return(d)
+}
+
+# Scenario 2 DGP (No subgroups)
+gen_data_cox_scen2 <- function(n = 500, cens_rate = 0.05) {
+  d <- data.frame(
+    trt = factor(rbinom(n, 1, 0.5), levels = 0:1, labels = c("no", "yes")),
+    x1  = rnorm(n, 0, 1),
+    x2  = rnorm(n, 0, 1),
+    z1  = runif(n, -1, 1),
+    z2  = runif(n, -1, 1),
+    z3  = runif(n, -1, 1),
+    z4  = runif(n, -1, 1),
+    z5  = runif(n, -1, 1)
+  )
+
+  # Homogeneous population (no effect of z1)
+  mu <- (0.5 * d$x1) + (-0.3 * d$x2) + (d$trt == "yes") * 0.8
+
+  t_event <- rexp(n) / exp(mu)
+  t_cens  <- rexp(n, rate = cens_rate)
+
+  d$time   <- pmin(t_event, t_cens)
+  d$cens   <- as.integer(t_event <= t_cens)
+  d$y_surv <- Surv(d$time, d$cens)
+  return(d)
+}
+
+# Scenario 4 DGP (Multicollinearity)
+gen_data_cox_scen4 <- function(n = 500, cens_rate = 0.05) {
+  rho           <- 0.7
+  x1            <- rnorm(n, 0, 1)
+  z2_correlated <- rho * x1 + sqrt(1 - rho^2) * rnorm(n, 0, 1)
+
+  d <- data.frame(
+    trt = factor(rbinom(n, 1, 0.5), levels = 0:1, labels = c("no", "yes")),
+    x1  = x1,
+    x2  = rnorm(n, 0, 1),
+    z1  = runif(n, -1, 1),
+    z2  = z2_correlated,
+    z3  = runif(n, -1, 1)
+  )
+  d$true_leaf <- as.integer(d$z1 > 0)
+
+  mu <- (0.5 * d$x1) + (-0.3 * d$x2) +
+    (d$true_leaf * 1.0) +
+    (d$trt == "yes") * (d$true_leaf * 0.8)
+
+  t_event <- rexp(n) / exp(mu)
+  t_cens  <- rexp(n, rate = cens_rate)
+
+  d$time   <- pmin(t_event, t_cens)
+  d$cens   <- as.integer(t_event <= t_cens)
+  d$y_surv <- Surv(d$time, d$cens)
+  return(d)
+}
+
+# ------------------------------------------------------------------------------
+# Part 2: Parallel Monte Carlo Simulation Engine
+# ------------------------------------------------------------------------------
+run_cox_scenario <- function(scenario, R = 500, n = 500, num_cores = 8) {
+  true_gamma <- c(x1 = 0.5, x2 = -0.3)
+
+  results <- mclapply(1:R, function(i) {
+    # Generate data based on scenario
+    if (scenario == 1) {
+      data_sim <- gen_data_cox_base(n = n, cens_rate = 0.05)
+      form     <- y_surv ~ trt | x1 + x2 | z1 + z2 + z3
+    } else if (scenario == 2) {
+      data_sim <- gen_data_cox_scen2(n = n, cens_rate = 0.05)
+      form     <- y_surv ~ trt | x1 + x2 | z1 + z2 + z3 + z4 + z5
+    } else if (scenario == 3) {
+      data_sim <- gen_data_cox_base(n = n, cens_rate = 1.5) # High censoring rate
+      form     <- y_surv ~ trt | x1 + x2 | z1 + z2 + z3
+    } else if (scenario == 4) {
+      data_sim <- gen_data_cox_scen4(n = n, cens_rate = 0.05)
+      form     <- y_surv ~ trt | x1 + x2 | z1 + z2 + z3
+    }
+
+    obs_cens <- 1 - mean(data_sim$cens)
+
+    # Fit Cox PALM tree
+    fit <- tryCatch({
+      palmtree_AmirR(
+        formula = form,
+        data    = data_sim,
+        method  = "cox",
+        minsize = 30
+      )
+    }, error = function(e) return(NULL))
+
+    if (is.null(fit)) return(NULL)
+
+    predicted_nodes <- fit$data$.tree
+    n_leaves        <- nlevels(predicted_nodes)
+
+    # Extract scenario-specific metrics
+    if (scenario == 2) {
+      metric_val <- as.integer(n_leaves > 1) # FPR
+    } else {
+      metric_val <- sum(apply(table(predicted_nodes, data_sim$true_leaf), 1, max)) / nrow(data_sim) # Purity
+    }
+
+    est_gamma <- coef(fit$palm)[c("x1", "x2")]
+
+    return(c(n_leaves = n_leaves, metric = metric_val, obs_cens = obs_cens, est_gamma))
+  }, mc.cores = num_cores)
+
+  # Filter out failed iterations
+  results    <- Filter(Negate(is.null), results)
+  res_matrix <- do.call(rbind, results)
+
+  # Compile final summary statistics
+  summary_stats <- data.frame(
+    Censoring_Rate = mean(res_matrix[, "obs_cens"]),
+    Mean_Leaves    = mean(res_matrix[, "n_leaves"])
+  )
+
+  if (scenario == 2) {
+    summary_stats$Type_I_Error <- mean(res_matrix[, "metric"])
+  } else {
+    summary_stats$Mean_Purity  <- mean(res_matrix[, "metric"])
+  }
+
+  summary_stats$Bias_x1      <- mean(res_matrix[, "x1"], na.rm = TRUE) - true_gamma["x1"]
+  summary_stats$Bias_x2      <- mean(res_matrix[, "x2"], na.rm = TRUE) - true_gamma["x2"]
+  summary_stats$RMSE_x1      <- sqrt(mean((res_matrix[, "x1"] - true_gamma["x1"])^2, na.rm = TRUE))
+  summary_stats$RMSE_x2      <- sqrt(mean((res_matrix[, "x2"] - true_gamma["x2"])^2, na.rm = TRUE))
+  summary_stats$Success_Rate <- nrow(res_matrix) / R
+
+  return(summary_stats)
+}
+
+# ------------------------------------------------------------------------------
+# Part 3: Execute All 4 Scenarios
+# ------------------------------------------------------------------------------
+RNGkind("L'Ecuyer-CMRG")
+cores_to_use <- 8
+R_iter       <- 50
+
+# Scenario 1 (Ideal)
+set.seed(3001)
+cat("\nRunning Scenario 1 (Cox - Ideal Structure)...\n")
+system.time({ sum_scen1 <- run_cox_scenario(1, R = R_iter, num_cores = cores_to_use) })
+print("--- Scenario 1 Results ---")
+print(sum_scen1)
+
+# Scenario 2 (No Subgroup)
+set.seed(3002)
+cat("\nRunning Scenario 2 (Cox - Type I Error)...\n")
+system.time({ sum_scen2 <- run_cox_scenario(2, R = R_iter, num_cores = cores_to_use) })
+print("--- Scenario 2 Results ---")
+print(sum_scen2)
+
+# Scenario 3 (High Censoring)
+set.seed(3003)
+cat("\nRunning Scenario 3 (Cox - High Censoring)...\n")
+system.time({ sum_scen3 <- run_cox_scenario(3, R = R_iter, num_cores = cores_to_use) })
+print("--- Scenario 3 Results ---")
+print(sum_scen3)
+
+# Scenario 4 (Multicollinearity)
+set.seed(3004)
+cat("\nRunning Scenario 4 (Cox - Multicollinearity)...\n")
+system.time({ sum_scen4 <- run_cox_scenario(4, R = R_iter, num_cores = cores_to_use) })
+print("--- Scenario 4 Results ---")
+print(sum_scen4)
+```
+
+## 7.3 Simulation Visualization
+
+```{r sim-viz}
+# 1. Build data frame from final summary table results
+df_sim <- data.frame(
+  Scenario = factor(
+    rep(c("1. Ideal", "2. No Subgroup (Type I Error)", "3. High Censoring", "4. Multicollinearity"), each = 2),
+    levels = c("1. Ideal", "2. No Subgroup (Type I Error)", "3. High Censoring", "4. Multicollinearity")
+  ),
+  Model        = rep(c("Cox PH", "Weibull"), 4),
+  Purity_TypeI = c(0.702, 0.996, 0.02, 0.08, 0.689, 0.849, 0.685, 0.995),
+  RMSE_x1      = c(0.096, 0.043, 0.050, 0.040, 0.086, 0.166, 0.094, 0.045)
+)
+
+# ==============================================================================
+# Plot 1: Structural Recovery (Purity) & Type I Error Comparison
+# ==============================================================================
+p1 <- ggplot(df_sim, aes(x = Scenario, y = Purity_TypeI, fill = Model)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8), width = 0.7, color = "black") +
+  geom_text(
+    aes(label = scales::percent(Purity_TypeI, accuracy = 0.1)),
+    position = position_dodge(width = 0.8),
+    vjust    = -0.5,
+    size     = 4.5,
+    fontface = "bold"
+  ) +
+  scale_fill_manual(values = c("Cox PH" = "#4682B4", "Weibull" = "#CD5C5C")) +
+  scale_y_continuous(labels = scales::percent_format(), limits = c(0, 1.1)) +
+  labs(
+    title    = "Structural Recovery (Purity) & Type I Error across Scenarios",
+    subtitle = "Higher is better for Scenarios 1, 3, 4 | Lower is better for Scenario 2",
+    x        = "Simulation Scenario",
+    y        = "Rate (Purity / Type I Error)",
+    fill     = "Base Model:"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position    = "top",
+    plot.title         = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle      = element_text(hjust = 0.5, color = "gray40"),
+    axis.text.x        = element_text(angle = 15, hjust = 1, face = "bold"),
+    panel.grid.major.x = element_blank()
+  )
+
+print(p1)
+
+# ==============================================================================
+# Plot 2: Root Mean Square Error (RMSE) Comparison for Global Variable X1
+# ==============================================================================
+p2 <- ggplot(df_sim, aes(x = Scenario, y = RMSE_x1, fill = Model)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8), width = 0.7, color = "black") +
+  geom_text(
+    aes(label = round(RMSE_x1, 3)),
+    position = position_dodge(width = 0.8),
+    vjust    = -0.5,
+    size     = 4.5,
+    fontface = "bold"
+  ) +
+  scale_fill_manual(values = c("Cox PH" = "#4682B4", "Weibull" = "#CD5C5C")) +
+  scale_y_continuous(limits = c(0, max(df_sim$RMSE_x1) * 1.15)) +
+  labs(
+    title    = "Estimation Accuracy: Root Mean Square Error (RMSE) of Global Effect X1",
+    subtitle = "Lower values indicate better estimation precision",
+    x        = "Simulation Scenario",
+    y        = "RMSE",
+    fill     = "Base Model:"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position    = "top",
+    plot.title         = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle      = element_text(hjust = 0.5, color = "gray40"),
+    axis.text.x        = element_text(angle = 15, hjust = 1, face = "bold"),
+    panel.grid.major.x = element_blank()
+  )
+
+print(p2)
+
+# Save high-resolution plots (300dpi) for publication
+# ggsave("Plot1_Purity.png", plot = p1, width = 10, height = 6, dpi = 300)
+# ggsave("Plot2_RMSE.png", plot = p2, width = 10, height = 6, dpi = 300)
+```
