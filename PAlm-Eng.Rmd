@@ -977,7 +977,7 @@ run_weibull_scenario <- function(scenario, R = 100, n = 500, num_cores = 8) {
 # ------------------------------------------------------------------------------
 RNGkind("L'Ecuyer-CMRG")
 cores_to_use <- 8
-R_iter       <- 5 # Set to 50 for initial testing
+R_iter       <- 50 # Set to 50 for initial testing
 
 # Scenario 1 (Ideal)
 set.seed(2001)
